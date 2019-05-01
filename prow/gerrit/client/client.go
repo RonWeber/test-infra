@@ -21,7 +21,6 @@ package client
 import (
 	"fmt"
 	"io/ioutil"
-	"net/url"
 	"strings"
 	"time"
 
@@ -229,7 +228,7 @@ func (c *Client) GetBranchRevision(instance, project, branch string) (string, er
 		return "", fmt.Errorf("not activated gerrit instance: %s", instance)
 	}
 
-	res, _, err := h.projectService.GetBranch(project, url.QueryEscape(branch))
+	res, _, err := h.projectService.GetBranch(project, branch)
 	if err != nil {
 		return "", err
 	}
@@ -296,7 +295,7 @@ func (h *gerritInstanceHandler) queryChangesForProject(project string, lastUpdat
 
 			// process if updated later than last updated
 			// stop if update was stale
-			if !updated.Before(lastUpdate) {
+			if updated.After(lastUpdate) {
 				switch change.Status {
 				case Merged:
 					submitted := parseStamp(*change.Submitted)
@@ -321,6 +320,7 @@ func (h *gerritInstanceHandler) queryChangesForProject(project string, lastUpdat
 						if message.RevisionNumber == rev.Number {
 							messageTime := parseStamp(message.Date)
 							if messageTime.After(lastUpdate) {
+								logrus.Infof("Change %d: Found a new message %s at time %v after lastSync at %v", change.Number, message.Message, messageTime, lastUpdate)
 								newMessages = true
 								break
 							}

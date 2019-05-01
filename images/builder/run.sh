@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# Copyright 2018 The Kubernetes Authors.
+#!/bin/sh
+# Copyright 2019 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,19 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# used in presubmits / CI testing
-# bazel build then unit test, exiting non-zero if either failed
+# Used by gcr.io/k8s-testimages/image-builder.
+# See ci-runner.sh for the version prow uses to build and run on the fly.
 
-res=0
+set -e
 
-bazel --bazelrc=rbe.bazelrc build //... --config=remote --remote_instance_name=projects/rbe-eytankidron-prod-0/instances/default_instance
-if [[ $? -ne 0 ]]; then
-    res=1
+echo "Activating service account..."
+gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
+
+echo "Running..."
+if [[ ! -z "${ARTIFACTS}" ]]; then
+  echo "\$ARTIFACTS is set, sending logs to ${ARTIFACTS}"
+  ./builder --log-dir="${ARTIFACTS}" "$@"
+else
+  ./builder "$@"
 fi
-
-bazel --bazelrc=rbe.bazelrc test //... --config=unit --config=remote --remote_instance_name=projects/rbe-eytankidron-prod-0/instances/default_instance
-if [[ $? -ne 0 ]]; then
-    res=1
-fi
-
-exit ${res}

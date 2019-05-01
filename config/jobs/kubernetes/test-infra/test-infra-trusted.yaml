@@ -57,7 +57,7 @@ postsubmits:
     decorate: true
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190329-811f7954b-master # whatever image you use here must have bash 4.4+
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190420-93fab49-master # whatever image you use here must have bash 4.4+
         command:
         - prow/push.sh
         env:
@@ -210,6 +210,31 @@ postsubmits:
             - --scratch-bucket=gs://k8s-testimages-scratch
             - --project=k8s-testimages
             - images/bazelbuild/
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /creds/service-account.json
+          volumeMounts:
+            - name: creds
+              mountPath: /creds
+      volumes:
+        - name: creds
+          secret:
+            secretName: deployer-service-account
+  - name: post-test-infra-push-bazel-krte
+    cluster: test-infra-trusted
+    run_if_changed: '^images/bazel-krte/'
+    decorate: true
+    branches:
+      - master
+    spec:
+      containers:
+        - image: gcr.io/k8s-testimages/gcloud-bazel:v20190402-v0.1-35-g8b2d62a
+          command:
+            - images/builder/ci-runner.sh
+          args:
+            - --scratch-bucket=gs://k8s-testimages-scratch
+            - --project=k8s-testimages
+            - images/bazel-krte/
           env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /creds/service-account.json
@@ -420,6 +445,31 @@ postsubmits:
         - name: creds
           secret:
             secretName: deployer-service-account
+  - name: post-test-infra-push-image-builder
+    cluster: test-infra-trusted
+    run_if_changed: '^images/builder/'
+    decorate: true
+    branches:
+      - master
+    spec:
+      containers:
+        - image: gcr.io/k8s-testimages/gcloud-bazel:v20190402-v0.1-35-g8b2d62a
+          command:
+            - images/builder/ci-runner.sh
+          args:
+            - --scratch-bucket=gs://k8s-testimages-scratch
+            - --project=k8s-testimages
+            - images/builder/
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /creds/service-account.json
+          volumeMounts:
+            - name: creds
+              mountPath: /creds
+      volumes:
+        - name: creds
+          secret:
+            secretName: deployer-service-account
   kubernetes/k8s.io:
   - name: post-k8sio-cip
     cluster: test-infra-trusted
@@ -433,7 +483,7 @@ postsubmits:
     - ^master$
     spec:
       containers:
-      - image: gcr.io/cip-demo-staging/cip:20190416-v2.0.0-0-g2d2e61b
+      - image: gcr.io/cip-demo-staging/cip:20190423-v2.0.1-0-g4db722e
         command:
         - multirun.sh
         args:
@@ -674,7 +724,7 @@ periodics:
   spec:
     containers:
     - name: branchprotector
-      image: gcr.io/k8s-prow/branchprotector:v20190418-92c3881f4
+      image: gcr.io/k8s-prow/branchprotector:v20190430-866dcd93f
       command:
       - /app/prow/cmd/branchprotector/app.binary
       args:
@@ -701,7 +751,7 @@ periodics:
   spec:
     containers:
     - name: label-sync
-      image: gcr.io/k8s-prow/label_sync:v20190418-92c3881f4
+      image: gcr.io/k8s-prow/label_sync:v20190430-866dcd93f
       command:
       - /app/label_sync/app.binary
       args:
@@ -753,7 +803,7 @@ periodics:
     # interactive bash session:
     #
     #   docker run --rm -it gcr.io/cip-demo-staging/cip:<tag> "cd /cip && bash"
-    - image: gcr.io/cip-demo-staging/cip:20190416-v2.0.0-0-g2d2e61b
+    - image: gcr.io/cip-demo-staging/cip:20190423-v2.0.1-0-g4db722e
       command:
       - multirun.sh
       args:

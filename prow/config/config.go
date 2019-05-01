@@ -41,7 +41,6 @@ import (
 
 	buildapi "github.com/knative/build/pkg/apis/build/v1alpha1"
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
-	"k8s.io/test-infra/prow/config/org"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/kube"
 	"k8s.io/test-infra/prow/pod-utils/decorate"
@@ -73,14 +72,14 @@ type JobConfig struct {
 
 // ProwConfig is config for all prow controllers
 type ProwConfig struct {
-	Tide             Tide                  `json:"tide,omitempty"`
-	Plank            Plank                 `json:"plank,omitempty"`
-	Sinker           Sinker                `json:"sinker,omitempty"`
-	Deck             Deck                  `json:"deck,omitempty"`
-	BranchProtection BranchProtection      `json:"branch-protection,omitempty"`
-	Orgs             map[string]org.Config `json:"orgs,omitempty"`
-	Gerrit           Gerrit                `json:"gerrit,omitempty"`
-	GitHubReporter   GitHubReporter        `json:"github_reporter,omitempty"`
+	Tide             Tide             `json:"tide,omitempty"`
+	Plank            Plank            `json:"plank,omitempty"`
+	Sinker           Sinker           `json:"sinker,omitempty"`
+	Deck             Deck             `json:"deck,omitempty"`
+	BranchProtection BranchProtection `json:"branch-protection,omitempty"`
+	Gerrit           Gerrit           `json:"gerrit,omitempty"`
+	GitHubReporter   GitHubReporter   `json:"github_reporter,omitempty"`
+	SlackReporter    *SlackReporter   `json:"slack_reporter,omitempty"`
 
 	// TODO: Move this out of the main config.
 	JenkinsOperators []JenkinsOperator `json:"jenkins_operators,omitempty"`
@@ -109,8 +108,8 @@ type ProwConfig struct {
 	// PushGateway is a prometheus push gateway.
 	PushGateway PushGateway `json:"push_gateway,omitempty"`
 
-	// OwnersDirBlacklist is used to configure which directories to ignore when
-	// searching for OWNERS{,_ALIAS} files in a repo.
+	// OwnersDirBlacklist is used to configure regular expressions matching directories
+	// to ignore when searching for OWNERS{,_ALIAS} files in a repo.
 	OwnersDirBlacklist OwnersDirBlacklist `json:"owners_dir_blacklist,omitempty"`
 
 	// Pub/Sub Subscriptions that we want to listen to
@@ -129,8 +128,8 @@ type ProwConfig struct {
 	DefaultJobTimeout time.Duration `json:"default_job_timeout,omitempty"`
 }
 
-// OwnersDirBlacklist is used to configure which directories to ignore when
-// searching for OWNERS{,_ALIAS} files in a repo.
+// OwnersDirBlacklist is used to configure regular expressions matching directories
+// to ignore when searching for OWNERS{,_ALIAS} files in a repo.
 type OwnersDirBlacklist struct {
 	// Repos configures a directory blacklist per repo (or org)
 	Repos map[string][]string `json:"repos"`
@@ -139,7 +138,7 @@ type OwnersDirBlacklist struct {
 	Default []string `json:"default"`
 }
 
-// DirBlacklist returns directories which are used to ignore when
+// DirBlacklist returns regular expressions matching directories to ignore when
 // searching for OWNERS{,_ALIAS} files in a repo.
 func (ownersDirBlacklist OwnersDirBlacklist) DirBlacklist(org, repo string) (blacklist []string) {
 	blacklist = append(blacklist, ownersDirBlacklist.Default...)
@@ -379,6 +378,36 @@ type GitHubOptions struct {
 	// LinkURL is the url representation of LinkURLFromConfig. This variable should be used
 	// in all places internally.
 	LinkURL *url.URL
+}
+
+// SlackReporter represents the config for the Slack reporter
+type SlackReporter struct {
+	JobTypesToReport  []prowapi.ProwJobType  `json:"job_types_to_report"`
+	JobStatesToReport []prowapi.ProwJobState `json:"job_states_to_report"`
+	Channel           string                 `json:"channel"`
+	ReportTemplate    string                 `json:"report_template"`
+}
+
+func (cfg *SlackReporter) DefaultAndValidate() error {
+	// Default ReportTemplate
+	if cfg.ReportTemplate == "" {
+		cfg.ReportTemplate = `Job {{.Spec.Job}} of type {{.Spec.Type}} ended with state {{.Status.State}}. <{{.Status.URL}}|View logs>`
+	}
+
+	if cfg.Channel == "" {
+		return errors.New("channel must be set")
+	}
+
+	// Validate ReportTemplate
+	tmpl, err := template.New("").Parse(cfg.ReportTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to parse template: %v", err)
+	}
+	if err := tmpl.Execute(&bytes.Buffer{}, &prowapi.ProwJob{}); err != nil {
+		return fmt.Errorf("failed to execute report_template: %v", err)
+	}
+
+	return nil
 }
 
 // Load loads and parses the config at path.
@@ -703,6 +732,12 @@ func (c *Config) validateComponentConfig() error {
 			return fmt.Errorf(`Invalid value for Planks job_url_prefix_config["%s"]: %v`, k, err)
 		}
 	}
+
+	if c.SlackReporter != nil {
+		if err := c.SlackReporter.DefaultAndValidate(); err != nil {
+			return fmt.Errorf("failed to validate slackreporter config: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -822,7 +857,7 @@ func (c *Config) validateJobConfig() error {
 const DefaultConfigPath = "/etc/config/config.yaml"
 
 // ConfigPath returns the value for the component's configPath if provided
-// explicityly or default otherwise.
+// explicitly or default otherwise.
 func ConfigPath(value string) string {
 
 	if value != "" {
@@ -1020,6 +1055,30 @@ func parseProwConfig(c *Config) error {
 			method != github.MergeSquash {
 			return fmt.Errorf("merge type %q for %s is not a valid type", method, name)
 		}
+	}
+
+	for name, templates := range c.Tide.MergeTemplate {
+		if templates.TitleTemplate != "" {
+			titleTemplate, err := template.New("CommitTitle").Parse(templates.TitleTemplate)
+
+			if err != nil {
+				return fmt.Errorf("parsing template for commit title: %v", err)
+			}
+
+			templates.Title = titleTemplate
+		}
+
+		if templates.BodyTemplate != "" {
+			bodyTemplate, err := template.New("CommitBody").Parse(templates.BodyTemplate)
+
+			if err != nil {
+				return fmt.Errorf("parsing template for commit body: %v", err)
+			}
+
+			templates.Body = bodyTemplate
+		}
+
+		c.Tide.MergeTemplate[name] = templates
 	}
 
 	for i, tq := range c.Tide.Queries {

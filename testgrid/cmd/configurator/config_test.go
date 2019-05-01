@@ -329,6 +329,7 @@ func TestJobsTestgridEntryMatch(t *testing.T) {
 		"kubeflow/katib",
 		"kubeflow/kubebench",
 		"kubeflow/kubeflow",
+		"kubeflow/metadata",
 		"kubeflow/mpi-operator",
 		"kubeflow/mxnet-operator",
 		"kubeflow/pytorch-operator",
@@ -359,6 +360,7 @@ func TestJobsTestgridEntryMatch(t *testing.T) {
 		"kubernetes-sigs/poseidon",
 		"kubernetes-sigs/kube-batch",
 		"kubernetes-sigs/structured-merge-diff",
+		"kubernetes-sigs/vsphere-csi-driver",
 		"tensorflow/minigo",
 	}) {
 		jobs[job.Name] = false
