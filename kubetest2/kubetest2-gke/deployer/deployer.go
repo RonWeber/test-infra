@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	// "path/filepath"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -51,16 +51,6 @@ var (
 	poolRe = regexp.MustCompile(`zones/([^/]+)/instanceGroupManagers/(gke-.*-([0-9a-f]{8})-grp)$`)
 
 	urlRe = regexp.MustCompile(`https://.*/`)
-
-	// Command line args that can't be put in the deployer struct directly.
-	gkeShape *string  
-	nodeImage       *string  
-	imageFamily      *string  
-	imageProject     *string  
-	gkeCommandGroup  *string  
-	gkeCreateCommand *string  
-	gkeCustomSubnet  *string  
-	gkeEnvironment   *string  
 )
 
 type gkeNodePool struct {
@@ -83,30 +73,31 @@ type deployer struct {
 	project                     string
 	zone                        string
 	region                      string
-	location                    string
 	additionalZones             string
 	nodeLocations               string
 	cluster                     string
-	shape                       map[string]gkeNodePool
+	shapeFlag                   string
 	network                     string
 	subnetwork                  string
 	subnetworkRegion            string
 	image                       string
 	imageFamily                 string
 	imageProject                string
-	commandGroup                []string
-	createCommand               []string
+	commandGroupFlag            string
+	createCommandFlag           string
 	singleZoneNodeInstanceGroup bool
-	endpoint                    string
-	clusterAPIVersion           string
+	customSubnetFlag            string
 
-	setup          bool
-	kubecfg        string
-	instanceGroups []*ig
+	setup          bool   //!
+	kubecfg        string //!
+	instanceGroups []*ig  //!
 
-	gkeCreateArgs                  string
-	gkeCustomSubnet                string
 	gkeSingleZoneNodeInstanceGroup bool
+
+	gkeEnvironment string
+
+	localLogsDir string
+	gcsLogsDir   string
 }
 
 // New implements deployer.New for gke
@@ -114,52 +105,79 @@ func New(opts types.Options) (types.Deployer, *pflag.FlagSet) {
 	// create a deployer object and set fields that are not flag controlled
 	d := &deployer{
 		commonOptions: opts,
-	}
-	// register flags and return
-	fs := bindFlags(d)
-	if d.zone != "" {
-		d.location = "--zone=" + d.zone
-	} else if d.region != "" {
-		d.location = "--region=" + d.region
+		localLogsDir:  filepath.Join(opts.ArtifactsDir(), "logs"),
 	}
 
-	if *nodeImage == "" {
-		return nil, fmt.Errorf("--gcp-node-image must be set for GKE deployment")
+	// register flags and return
+	return d, bindFlags(d)
+}
+
+func (d *deployer) verifyFlags() error {
+	if d.cluster == "" {
+		return fmt.Errorf("--cluster must be set for GKE deployment")
 	}
-	if strings.ToUpper(*nodeImage) == "CUSTOM" {
-		if *imageFamily == "" || *imageProject == "" {
-			return nil, fmt.Errorf("--image-family and --image-project must be set for GKE deployment if --gcp-node-image=CUSTOM")
+	if d.project == "" {
+		return fmt.Errorf("--project must be set for GKE deployment")
+	}
+	if d.network == "" {
+		return fmt.Errorf("--network must be set for GKE deployment")
+	}
+	if d.image == "" {
+		return fmt.Errorf("--node-image must be set for GKE deployment")
+	}
+	if strings.ToUpper(d.image) == "CUSTOM" {
+		if d.imageFamily == "" || d.imageProject == "" {
+			return fmt.Errorf("--image-family and --image-project must be set for GKE deployment if --node-image=CUSTOM")
 		}
 	}
-	d.imageFamily = *imageFamily
-	d.imageProject = *imageProject
-	d.image = *nodeImage
-	d.commandGroup = strings.Fields(*gkeCommandGroup)
-	d.createCommand = append([]string{}, d.commandGroup...)
-	d.createCommand = append(d.createCommand, strings.Fields(*gkeCreateCommand)...)
+	return nil
+}
 
-	err := json.Unmarshal([]byte(*gkeShape), &d.shape)
+func (d *deployer) location() (string, error) {
+	if d.zone == "" && d.region == "" {
+		return "", fmt.Errorf("--zone or --region must be set for GKE deployment")
+	} else if d.zone != "" && d.region != "" {
+		return "", fmt.Errorf("--zone and --region cannot both be set")
+	}
+
+	if d.zone != "" {
+		return "--zone=" + d.zone, nil
+	} else {
+		return "--region" + d.region, nil
+	}
+}
+
+func (d *deployer) shape() (map[string]gkeNodePool, error) {
+	var result map[string]gkeNodePool
+	err := json.Unmarshal([]byte(d.shapeFlag), &result)
 	if err != nil {
-		return nil, fmt.Errorf("--gke-shape must be valid JSON, unmarshal error: %v, JSON: %q", err, *gkeShape)
+		return nil, fmt.Errorf("--shape must be valid JSON, unmarshal error: %v, JSON: %q", err, d.shapeFlag)
 	}
-	if _, ok := d.shape[defaultPool]; !ok {
-		return nil, fmt.Errorf("--gke-shape must include a node pool named 'default', found %q", *gkeShape)
+	if _, ok := result[defaultPool]; !ok {
+		return nil, fmt.Errorf("--shape must include a node pool named 'default', found %q", d.shapeFlag)
 	}
+	return result, nil
+}
 
-	switch env := *gkeEnvironment; {
+func (d *deployer) createCommand() []string {
+	return append(strings.Fields(d.commandGroupFlag), strings.Fields(d.createCommandFlag)...)
+}
+
+func (d *deployer) endpoint() (string, error) {
+	var result string
+	switch env := d.gkeEnvironment; {
 	case env == "test":
-		endpoint = "https://test-container.sandbox.googleapis.com/"
+		result = "https://test-container.sandbox.googleapis.com/"
 	case env == "staging":
-		endpoint = "https://staging-container.sandbox.googleapis.com/"
+		result = "https://staging-container.sandbox.googleapis.com/"
 	case env == "prod":
-		endpoint = "https://container.googleapis.com/"
+		result = "https://container.googleapis.com/"
 	case urlRe.MatchString(env):
-		endpoint = env
+		result = env
 	default:
-		return nil, fmt.Errorf("--gke-environment must be one of {test,staging,prod} or match %v, found %q", urlRe, env)
+		return "", fmt.Errorf("--gke-environment must be one of {test,staging,prod} or match %v, found %q", urlRe, env)
 	}
-
-	return d, fs
+	return "", nil
 }
 
 // assert that New implements types.NewDeployer
@@ -168,38 +186,26 @@ var _ types.NewDeployer = New
 func bindFlags(d *deployer) *pflag.FlagSet {
 	flags := pflag.NewFlagSet(Name, pflag.ContinueOnError)
 
-	flags.StringVar(&gkeShape, "gke-shape", `{"default":{"Nodes":3,"MachineType":"n1-standard-2"}}`, `(gke only) A JSON description of node pools to create. The node pool 'default' is required and used for initial cluster creation. All node pools are symmetric across zones, so the cluster total node count is {total nodes in --gke-shape} * {1 + (length of --gke-additional-zones)}. Example: '{"default":{"Nodes":999,"MachineType:":"n1-standard-1"},"heapster":{"Nodes":1, "MachineType":"n1-standard-8", "ExtraArgs": []}}`)
-	flags.StringVar(&nodeImage, "node-image", "", "Node image type (cos|container_vm on GKE, cos|debian on GCE)")
-	flags.StringVar(&imageFamily, "image-family", "", "Node image family from which to use the latest image, required when --gcp-node-image=CUSTOM")
-	flags.StringVar(&imageProject, "image-project", "", "Project containing node image family, required when --gcp-node-image=CUSTOM")
-	flags.StringVar(&gkeCommandGroup, "gke-command-group", "", "(gke only) Use a different gcloud track (e.g. 'alpha') for all 'gcloud container' commands. Note: This is added to --gke-create-command on create. You should only use --gke-command-group if you need to change the gcloud track for *every* gcloud container command.")
-	flags.StringVar(&gkeCreateCommand, "gke-create-command", defaultCreate, "(gke only) gcloud subcommand used to create a cluster. Modify if you need to pass arbitrary arguments to create.")
-	flags.StringVar(&gkeCustomSubnet, "gke-custom-subnet", "", "(gke only) if specified, we create a custom subnet with the specified options and use it for the gke cluster. The format should be '<subnet-name> --region=<subnet-gcp-region> --range=<subnet-cidr> <any other optional params>'.")
-	flags.StringVar(&gkeEnvironment, "gke-environment", "", "(gke only) Container API endpoint to use, one of 'test', 'staging', 'prod', or a custom https:// URL")
-
+	flags.StringVar(&d.additionalZones, "additional-zones", "", "(List of additional Google Compute Engine zones to use. Clusters are created symmetrically across zones by default, see --shape for details.")
 	flags.StringVar(&d.cluster, "cluster", "", "Cluster name. Must be set for --deployment=gke (TODO: other deployments).")
-	flags.StringVar(&d.additionalZones, "additional-zones", "(gke only) List of additional Google Compute Engine zones to use. Clusters are created symmetrically across zones by default, see --gke-shape for details.")
-	flags.StringVar(&d.nodeLocations, "node-locations", "", "(gke only) List of Google Compute Engine zones to use.")
-	flags.StringVar(&d.gkeEnvironment, "environment", "", "(gke only) Container API endpoint to use, one of 'test', 'staging', 'prod', or a custom https:// URL")
-	flags.StringVar(&d.gkeCommandGroup, "command-group", "", "(gke only) Use a different gcloud track (e.g. 'alpha') for all 'gcloud container' commands. Note: This is added to --gke-create-command on create. You should only use --gke-command-group if you need to change the gcloud track for *every* gcloud container command.")
-	flags.StringVar(&d.gkeCreateCommand, "create-command", defaultCreate, "(gke only) gcloud subcommand used to create a cluster. Modify if you need to pass arbitrary arguments to create.")
-	flags.StringVar(&d.gkeCustomSubnet, "custom-subnet", "", "(gke only) if specified, we create a custom subnet with the specified options and use it for the gke cluster. The format should be '<subnet-name> --region=<subnet-gcp-region> --range=<subnet-cidr> <any other optional params>'.")
-	flags.BoolVar(&d.gkeSingleZoneNodeInstanceGroup, "single-zone-node-instance-group", true, "(gke only) Add instance groups from a single zone to the NODE_INSTANCE_GROUP env variable.")
-
+	flags.StringVar(&d.commandGroupFlag, "command-group", "", "Use a different gcloud track (e.g. 'alpha') for all 'gcloud container' commands. Note: This is added to --create-command on create. You should only use --command-group if you need to change the gcloud track for *every* gcloud container command.")
+	flags.StringVar(&d.createCommandFlag, "create-command", defaultCreate, "gcloud subcommand used to create a cluster. Modify if you need to pass arbitrary arguments to create.")
+	flags.StringVar(&d.customSubnetFlag, "custom-subnet", "", "If specified, we create a custom subnet with the specified options and use it for the gke cluster. The format should be '<subnet-name> --region=<subnet-gcp-region> --range=<subnet-cidr> <any other optional params>'.")
 	flags.StringVar(&d.gcpCloudSdk, "gcp-cloud-sdk", "", "Install/upgrade google-cloud-sdk to the gs:// path if set")
-	flags.StringVar(&d.project, "gcp-project", "", "For use with gcloud commands")
 	flags.StringVar(&d.gcpProjectType, "gcp-project-type", "", "Explicitly indicate which project type to select from boskos")
 	flags.StringVar(&d.gcpServiceAccount, "gcp-service-account", "", "Service account to activate before using gcloud")
-	flags.StringVar(&d.zone, "gcp-zone", "", "For use with gcloud commands")
-	flags.StringVar(&d.region, "gcp-region", "", "For use with gcloud commands")
-	flags.StringVar(&d.network, "gcp-network", "", "Cluster network. Must be set for --deployment=gke (TODO: other deployments).")
-	flags.StringVar(&d.gcpNodes, "gcp-nodes", "", "(--provider=gce only) Number of nodes to create.")
-	flags.StringVar(&d.gcpNodeSize, "gcp-node-size", "", "(--provider=gce only) Size of nodes to create (e.g n1-standard-1).")
-	flags.StringVar(&d.kubemarkMasterSize, "kubemark-master-size", "", "Kubemark master size (only relevant if --kubemark=true). Auto-calculated based on '--kubemark-nodes' if left empty.")
-	flags.StringVar(&d.testArgs, "test_args", "", "Space-separated list of arguments to pass to Ginkgo test runner.")
-	flags.StringVar(&d.testCmd, "test-cmd", "", "command to run against the cluster instead of Ginkgo e2e tests")
-	flags.StringVar(&d.testCmdName, "test-cmd-name", "", "name to log the test command as in xml results")
-	flags.StringVar(&d.clusterAPIVersion, "cluster-api-version", "", "Version of the cluster API to use")
+	flags.StringVar(&d.gkeEnvironment, "gke-environment", "", "Container API endpoint to use, one of 'test', 'staging', 'prod',who or a custom https:// URL")
+	flags.StringVar(&d.imageFamily, "image-family", "", "Node image family from which to use the latest image, required when --node-image=CUSTOM")
+	flags.StringVar(&d.imageProject, "image-project", "", "Project containing node image family, required when --node-image=CUSTOM")
+	flags.StringVar(&d.network, "network", "", "Cluster network. Must be set.")
+	flags.StringVar(&d.image, "node-image", "", "Node image type (cos|container_vm)")
+	flags.StringVar(&d.nodeLocations, "node-locations", "", "List of Google Compute Engine zones to use.")
+	flags.StringVar(&d.project, "project", "", "For use with gcloud commands")
+	flags.StringVar(&d.region, "region", "", "For use with gcloud commands")
+	flags.BoolVar(&d.singleZoneNodeInstanceGroup, "single-zone-node-instance-group", true, "(gke only) Add instance groups from a single zone to the NODE_INSTANCE_GROUP env variable.")
+	flags.StringVar(&d.zone, "zone", "", "For use with gcloud commands")
+	flags.StringVar(&d.shapeString, "shape", `{"default":{"Nodes":3,"MachineType":"n1-standard-2"}}`, `A JSON description of node pools to create. The node pool 'default' is required and used for initial cluster creation. All node pools are symmetric across zones, so the cluster total node count is {total nodes in --gke-shape} * {1 + (length of --gke-additional-zones)}. Example: '{"default":{"Nodes":999,"MachineType:":"n1-standard-1"},"heapster":{"Nodes":1, "MachineType":"n1-standard-8", "ExtraArgs": []}}`)
+
 	return flags
 }
 
@@ -209,6 +215,9 @@ var _ types.Deployer = &deployer{}
 // Deployer implementation methods below
 
 func (d *deployer) Up() error {
+	if err := d.verifyFlags(); err != nil {
+		return err
+	}
 	// Create network if it doesn't exist.
 	if control.NoOutput(exec.Command("gcloud", "compute", "networks", "describe", d.network,
 		"--project="+d.project,
@@ -270,8 +279,10 @@ func (d *deployer) Up() error {
 			}
 		}
 	}
-	if d.clusterAPIVersion != "" {
-		args = append(args, "--cluster-version"+d.clusterAPIVersion)
+	// TODO(zmerlynn): The version should be plumbed through Extract
+	// or a separate flag rather than magic env variables.
+	if v := os.Getenv("CLUSTER_API_VERSION"); v != "" {
+		args = append(args, "--cluster-version="+v)
 	}
 	args = append(args, d.cluster)
 	if err := control.FinishRunning(exec.Command("gcloud", args...)); err != nil {
@@ -295,7 +306,7 @@ func (d *deployer) Up() error {
 	return nil
 }
 
-func (d *deployer) IsUp() error {
+func (d *deployer) IsUp() (bool, error) {
 	return isUp(g)
 }
 
@@ -321,7 +332,7 @@ func (d *deployer) Down() error {
 // the least gross hack to get this done.
 //
 // TODO(shyamjvs): Make this work with multizonal and regional clusters.
-func (d *deployer) DumpClusterLogs(localPath, gcsPath string) error {
+func (d *deployer) DumpClusterLogs() error {
 	// gkeLogDumpTemplate is a template of a shell script where
 	// - %[1]s is the project
 	// - %[2]s is the zone
@@ -344,8 +355,8 @@ export KUBE_NODE_OS_DISTRIBUTION='%[3]s'
 %[5]s
 `
 	// Prevent an obvious injection.
-	if strings.Contains(localPath, "'") || strings.Contains(gcsPath, "'") {
-		return fmt.Errorf("%q or %q contain single quotes - nice try", localPath, gcsPath)
+	if strings.Contains(d.localLogsDir, "'") || strings.Contains(d.gcsLogsDir, "'") {
+		return fmt.Errorf("%q or %q contain single quotes - nice try", d.localLogsDir, d.gcsLogsDir)
 	}
 
 	// Generate a slice of filters to be OR'd together below
@@ -359,10 +370,10 @@ export KUBE_NODE_OS_DISTRIBUTION='%[3]s'
 
 	// Generate the log-dump.sh command-line
 	var dumpCmd string
-	if gcsPath == "" {
-		dumpCmd = fmt.Sprintf("./cluster/log-dump/log-dump.sh '%s'", localPath)
+	if d.gcsLogsDir == "" {
+		dumpCmd = fmt.Sprintf("./cluster/log-dump/log-dump.sh '%s'", d.localLogsDir)
 	} else {
-		dumpCmd = fmt.Sprintf("./cluster/log-dump/log-dump.sh '%s' '%s'", localPath, gcsPath)
+		dumpCmd = fmt.Sprintf("./cluster/log-dump/log-dump.sh '%s' '%s'", d.localLogsDir, d.gcsLogsDir)
 	}
 	return control.FinishRunning(exec.Command("bash", "-c", fmt.Sprintf(gkeLogDumpTemplate,
 		d.project,
@@ -414,6 +425,9 @@ func (d *deployer) getKubeConfig() error {
 }
 
 func (d *deployer) Build() error {
+	if err := d.verifyFlags(); err != nil {
+		return err
+	}
 	// TODO(bentheelder): build type should be configurable
 	args := []string{
 		"build", "node-image",
