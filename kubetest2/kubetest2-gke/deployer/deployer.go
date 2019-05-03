@@ -20,16 +20,18 @@ package deployer
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/pflag"
 
 	"k8s.io/test-infra/kubetest2/pkg/exec"
-	// "k8s.io/test-infra/kubetest2/pkg/metadata"
-	"k8s.io/test-infra/kubetest2/pkg/process"
+	"k8s.io/test-infra/kubetest2/pkg/metadata"
+	//"k8s.io/test-infra/kubetest2/pkg/process"
 	"k8s.io/test-infra/kubetest2/pkg/types"
 )
 
@@ -86,7 +88,10 @@ type deployer struct {
 	commandGroupFlag            string
 	createCommandFlag           string
 	singleZoneNodeInstanceGroup bool
-	customSubnetFlag            string
+	customSubnet            string
+	gcpCloudSDK string
+	gcpProjectType string
+	gcpServiceAccount string
 
 	setup          bool   //!
 	kubecfg        string //!
@@ -112,6 +117,8 @@ func New(opts types.Options) (types.Deployer, *pflag.FlagSet) {
 	return d, bindFlags(d)
 }
 
+// verifyFlags validates that required flags are set, as well as
+// ensuring that location(), shape(), and endpoint() will not return errors.
 func (d *deployer) verifyFlags() error {
 	if d.cluster == "" {
 		return fmt.Errorf("--cluster must be set for GKE deployment")
@@ -129,6 +136,15 @@ func (d *deployer) verifyFlags() error {
 		if d.imageFamily == "" || d.imageProject == "" {
 			return fmt.Errorf("--image-family and --image-project must be set for GKE deployment if --node-image=CUSTOM")
 		}
+	}
+	if _, err := d.location(); err != nil {
+		return err
+	}
+	if _, err := d.shape(); err != nil {
+		return err
+	}
+	if _, err := d.endpoint(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -190,8 +206,8 @@ func bindFlags(d *deployer) *pflag.FlagSet {
 	flags.StringVar(&d.cluster, "cluster", "", "Cluster name. Must be set for --deployment=gke (TODO: other deployments).")
 	flags.StringVar(&d.commandGroupFlag, "command-group", "", "Use a different gcloud track (e.g. 'alpha') for all 'gcloud container' commands. Note: This is added to --create-command on create. You should only use --command-group if you need to change the gcloud track for *every* gcloud container command.")
 	flags.StringVar(&d.createCommandFlag, "create-command", defaultCreate, "gcloud subcommand used to create a cluster. Modify if you need to pass arbitrary arguments to create.")
-	flags.StringVar(&d.customSubnetFlag, "custom-subnet", "", "If specified, we create a custom subnet with the specified options and use it for the gke cluster. The format should be '<subnet-name> --region=<subnet-gcp-region> --range=<subnet-cidr> <any other optional params>'.")
-	flags.StringVar(&d.gcpCloudSdk, "gcp-cloud-sdk", "", "Install/upgrade google-cloud-sdk to the gs:// path if set")
+	flags.StringVar(&d.customSubnet, "custom-subnet", "", "If specified, we create a custom subnet with the specified options and use it for the gke cluster. The format should be '<subnet-name> --region=<subnet-gcp-region> --range=<subnet-cidr> <any other optional params>'.")
+	flags.StringVar(&d.gcpCloudSDK, "gcp-cloud-sdk", "", "Install/upgrade google-cloud-sdk to the gs:// path if set")
 	flags.StringVar(&d.gcpProjectType, "gcp-project-type", "", "Explicitly indicate which project type to select from boskos")
 	flags.StringVar(&d.gcpServiceAccount, "gcp-service-account", "", "Service account to activate before using gcloud")
 	flags.StringVar(&d.gkeEnvironment, "gke-environment", "", "Container API endpoint to use, one of 'test', 'staging', 'prod',who or a custom https:// URL")
@@ -204,7 +220,7 @@ func bindFlags(d *deployer) *pflag.FlagSet {
 	flags.StringVar(&d.region, "region", "", "For use with gcloud commands")
 	flags.BoolVar(&d.singleZoneNodeInstanceGroup, "single-zone-node-instance-group", true, "(gke only) Add instance groups from a single zone to the NODE_INSTANCE_GROUP env variable.")
 	flags.StringVar(&d.zone, "zone", "", "For use with gcloud commands")
-	flags.StringVar(&d.shapeString, "shape", `{"default":{"Nodes":3,"MachineType":"n1-standard-2"}}`, `A JSON description of node pools to create. The node pool 'default' is required and used for initial cluster creation. All node pools are symmetric across zones, so the cluster total node count is {total nodes in --gke-shape} * {1 + (length of --gke-additional-zones)}. Example: '{"default":{"Nodes":999,"MachineType:":"n1-standard-1"},"heapster":{"Nodes":1, "MachineType":"n1-standard-8", "ExtraArgs": []}}`)
+	flags.StringVar(&d.shapeFlag, "shape", `{"default":{"Nodes":3,"MachineType":"n1-standard-2"}}`, `A JSON description of node pools to create. The node pool 'default' is required and used for initial cluster creation. All node pools are symmetric across zones, so the cluster total node count is {total nodes in --shape} * {1 + (length of --additional-zones)}. Example: '{"default":{"Nodes":999,"MachineType:":"n1-standard-1"},"heapster":{"Nodes":1, "MachineType":"n1-standard-8", "ExtraArgs": []}}`)
 
 	return flags
 }
@@ -212,43 +228,54 @@ func bindFlags(d *deployer) *pflag.FlagSet {
 // assert that deployer implements types.Deployer
 var _ types.Deployer = &deployer{}
 
-// Deployer implementation methods below
+func (d *deployer) Build() error {
+	return fmt.Errorf("build is not implemented for GKE deployer.")
+}
 
+// Deployer implementation methods below
 func (d *deployer) Up() error {
 	if err := d.verifyFlags(); err != nil {
 		return err
 	}
 	// Create network if it doesn't exist.
-	if control.NoOutput(exec.Command("gcloud", "compute", "networks", "describe", d.network,
+	if runWithNoOutput(exec.Command("gcloud", "compute", "networks", "describe", d.network,
 		"--project="+d.project,
 		"--format=value(name)")) != nil {
 		// Assume error implies non-existent.
 		log.Printf("Couldn't describe network '%s', assuming it doesn't exist and creating it", d.network)
-		if err := control.FinishRunning(exec.Command("gcloud", "compute", "networks", "create", d.network,
+		if err := exec.Command("gcloud", "compute", "networks", "create", d.network,
 			"--project="+d.project,
-			"--subnet-mode=auto")); err != nil {
+			"--subnet-mode=auto").Run(); err != nil {
 			return err
 		}
 	}
 	// Create a custom subnet in that network if it was asked for.
-	if *gkeCustomSubnet != "" {
-		customSubnetFields := strings.Fields(*gkeCustomSubnet)
+	if d.customSubnet != "" {
+		customSubnetFields := strings.Fields(d.customSubnet)
 		createSubnetCommand := []string{"compute", "networks", "subnets", "create"}
 		createSubnetCommand = append(createSubnetCommand, "--project="+d.project, "--network="+d.network)
 		createSubnetCommand = append(createSubnetCommand, customSubnetFields...)
-		if err := control.FinishRunning(exec.Command("gcloud", createSubnetCommand...)); err != nil {
+		if err := exec.Command("gcloud", createSubnetCommand...).Run(); err != nil {
 			return err
 		}
 		d.subnetwork = customSubnetFields[0]
 		d.subnetworkRegion = customSubnetFields[1]
 	}
 
-	def := d.shape[defaultPool]
-	args := make([]string, len(d.createCommand))
-	copy(args, d.createCommand)
+	shape, err := d.shape()
+	if err != nil {
+		return err
+	}
+	def := shape[defaultPool]
+	loc, err := d.location()
+	if err != nil {
+		return err
+	}
+	args := make([]string, len(d.createCommand()))
+	copy(args, d.createCommand())
 	args = append(args,
 		"--project="+d.project,
-		d.location,
+		loc,
 		"--machine-type="+def.MachineType,
 		"--image-type="+d.image,
 		"--num-nodes="+strconv.Itoa(def.Nodes),
@@ -285,43 +312,36 @@ func (d *deployer) Up() error {
 		args = append(args, "--cluster-version="+v)
 	}
 	args = append(args, d.cluster)
-	if err := control.FinishRunning(exec.Command("gcloud", args...)); err != nil {
+	if err := exec.Command("gcloud", args...).Run(); err != nil {
 		return fmt.Errorf("error creating cluster: %v", err)
 	}
-	for poolName, pool := range d.shape {
+	for poolName, pool := range shape {
 		if poolName == defaultPool {
 			continue
 		}
 		poolArgs := []string{"node-pools", "create", poolName,
 			"--cluster=" + d.cluster,
 			"--project=" + d.project,
-			d.location,
+			loc,
 			"--machine-type=" + pool.MachineType,
 			"--num-nodes=" + strconv.Itoa(pool.Nodes)}
 		poolArgs = append(poolArgs, pool.ExtraArgs...)
-		if err := control.FinishRunning(exec.Command("gcloud", d.containerArgs(poolArgs...)...)); err != nil {
+		if err := exec.Command("gcloud", d.containerArgs(poolArgs...)...).Run(); err != nil {
 			return fmt.Errorf("error creating node pool %q: %v", poolName, err)
 		}
 	}
 	return nil
 }
 
-func (d *deployer) IsUp() (bool, error) {
-	return isUp(g)
-}
-
-func (d *deployer) Down() error {
-	args := []string{
-		"delete", "cluster",
-		"--name", d.clusterName,
+func (d *deployer) IsUp() (up bool, err error) {
+	// naively assume that if the api server reports nodes, the cluster is up
+	lines, err := exec.CombinedOutputLines(
+		exec.Command("kubectl", "get", "nodes", "-o=name"),
+	)
+	if err != nil {
+		return false, metadata.NewJUnitError(err, strings.Join(lines, "\n"))
 	}
-	if d.logLevel != "" {
-		args = append(args, "--loglevel", d.logLevel)
-	}
-
-	println("Down(): deleting kind cluster...\n")
-	// we want to see the output so use process.ExecJUnit
-	return process.ExecJUnit("kind", args, os.Environ())
+	return len(lines) > 0, nil
 }
 
 // DumpClusterLogs for GKE generates a small script that wraps
@@ -375,12 +395,12 @@ export KUBE_NODE_OS_DISTRIBUTION='%[3]s'
 	} else {
 		dumpCmd = fmt.Sprintf("./cluster/log-dump/log-dump.sh '%s' '%s'", d.localLogsDir, d.gcsLogsDir)
 	}
-	return control.FinishRunning(exec.Command("bash", "-c", fmt.Sprintf(gkeLogDumpTemplate,
+	return exec.Command("bash", "-c", fmt.Sprintf(gkeLogDumpTemplate,
 		d.project,
 		d.zone,
 		os.Getenv("NODE_OS_DISTRIBUTION"),
 		strings.Join(filters, " OR "),
-		dumpCmd)))
+		dumpCmd)).Run()
 }
 
 func (d *deployer) TestSetup() error {
@@ -416,39 +436,16 @@ func (d *deployer) getKubeConfig() error {
 	if err := os.Setenv("KUBECONFIG", d.kubecfg); err != nil {
 		return err
 	}
-	if err := control.FinishRunning(exec.Command("gcloud", d.containerArgs("clusters", "get-credentials", d.cluster,
+	loc, err := d.location()
+	if err != nil {
+		return err
+	}
+	if err := exec.Command("gcloud", d.containerArgs("clusters", "get-credentials", d.cluster,
 		"--project="+d.project,
-		d.location)...)); err != nil {
+		loc)...).Run(); err != nil {
 		return fmt.Errorf("error executing get-credentials: %v", err)
 	}
 	return nil
-}
-
-func (d *deployer) Build() error {
-	if err := d.verifyFlags(); err != nil {
-		return err
-	}
-	// TODO(bentheelder): build type should be configurable
-	args := []string{
-		"build", "node-image",
-	}
-	if d.logLevel != "" {
-		args = append(args, "--loglevel", d.logLevel)
-	}
-	if d.buildType != "" {
-		args = append(args, "--type", d.buildType)
-	}
-	// set the explicitly specified image name if set
-	if d.nodeImage != "" {
-		args = append(args, "--image", d.nodeImage)
-	} else if d.commonOptions.ShouldBuild() {
-		// otherwise if we just built an image, use that
-		args = append(args, "--image", kindDefaultBuiltImageName)
-	}
-
-	println("Build(): building kind node image...\n")
-	// we want to see the output so use process.ExecJUnit
-	return process.ExecJUnit("kind", args, os.Environ())
 }
 
 // setupEnv is to appease ginkgo-e2e.sh and other pieces of the e2e infrastructure. It
@@ -480,7 +477,7 @@ func (d *deployer) ensureFirewall() error {
 	if err != nil {
 		return fmt.Errorf("error getting unique firewall: %v", err)
 	}
-	if control.NoOutput(exec.Command("gcloud", "compute", "firewall-rules", "describe", firewall,
+	if runWithNoOutput(exec.Command("gcloud", "compute", "firewall-rules", "describe", firewall,
 		"--project="+d.project,
 		"--format=value(name)")) == nil {
 		// Assume that if this unique firewall exists, it's good to go.
@@ -488,24 +485,24 @@ func (d *deployer) ensureFirewall() error {
 	}
 	log.Printf("Couldn't describe firewall '%s', assuming it doesn't exist and creating it", firewall)
 
-	tagOut, err := exec.Command("gcloud", "compute", "instances", "list",
+	tagOut, err := exec.Output(exec.Command("gcloud", "compute", "instances", "list",
 		"--project="+d.project,
 		"--filter=metadata.created-by:*"+d.instanceGroups[0].path,
 		"--limit=1",
-		"--format=get(tags.items)").Output()
+		"--format=get(tags.items)"))
 	if err != nil {
-		return fmt.Errorf("instances list failed: %s", util.ExecError(err))
+		return fmt.Errorf("instances list failed: %s", err)
 	}
 	tag := strings.TrimSpace(string(tagOut))
 	if tag == "" {
 		return fmt.Errorf("instances list returned no instances (or instance has no tags)")
 	}
 
-	if err := control.FinishRunning(exec.Command("gcloud", "compute", "firewall-rules", "create", firewall,
+	if err := exec.Command("gcloud", "compute", "firewall-rules", "create", firewall,
 		"--project="+d.project,
 		"--network="+d.network,
 		"--allow="+e2eAllow,
-		"--target-tags="+tag)); err != nil {
+		"--target-tags="+tag).Run(); err != nil {
 		return fmt.Errorf("error creating e2e firewall: %v", err)
 	}
 	return nil
@@ -515,10 +512,14 @@ func (d *deployer) getInstanceGroups() error {
 	if len(d.instanceGroups) > 0 {
 		return nil
 	}
-	igs, err := exec.Command("gcloud", d.containerArgs("clusters", "describe", d.cluster,
+	location, err := d.location()
+	if err != nil {
+		return err
+	}
+	igs, err := exec.Output(exec.Command("gcloud", d.containerArgs("clusters", "describe", d.cluster,
 		"--format=value(instanceGroupUrls)",
 		"--project="+d.project,
-		d.location)...).Output()
+		location)...))
 	if err != nil {
 		return fmt.Errorf("instance group URL fetch failed: %s", util.ExecError(err))
 	}
@@ -551,10 +552,10 @@ func (d *deployer) getClusterFirewall() (string, error) {
 // This function ensures that all firewall-rules are deleted from specific network.
 // We also want to keep in logs that there were some resources leaking.
 func (d *deployer) cleanupNetworkFirewalls() (int, error) {
-	fws, err := exec.Command("gcloud", "compute", "firewall-rules", "list",
+	fws, err := exec.Output(exec.Command("gcloud", "compute", "firewall-rules", "list",
 		"--format=value(name)",
 		"--project="+d.project,
-		"--filter=network:"+d.network).Output()
+		"--filter=network:"+d.network))
 	if err != nil {
 		return 0, fmt.Errorf("firewall rules list failed: %s", util.ExecError(err))
 	}
@@ -564,7 +565,7 @@ func (d *deployer) cleanupNetworkFirewalls() (int, error) {
 		commandArgs := []string{"compute", "firewall-rules", "delete", "-q"}
 		commandArgs = append(commandArgs, fwList...)
 		commandArgs = append(commandArgs, "--project="+d.project)
-		errFirewall := control.FinishRunning(exec.Command("gcloud", commandArgs...))
+		errFirewall := exec.Command("gcloud", commandArgs...).Run()
 		if errFirewall != nil {
 			return 0, fmt.Errorf("error deleting firewall: %v", errFirewall)
 		}
@@ -582,10 +583,10 @@ func (d *deployer) Down() error {
 	d.instanceGroups = nil
 
 	// We best-effort try all of these and report errors as appropriate.
-	errCluster := control.FinishRunning(exec.Command(
+	errCluster := exec.Command(
 		"gcloud", d.containerArgs("clusters", "delete", "-q", d.cluster,
 			"--project="+d.project,
-			d.location)...))
+			d.location)...).Run()
 
 	// don't delete default network
 	if d.network == "default" {
@@ -600,19 +601,19 @@ func (d *deployer) Down() error {
 		"--project="+d.project,
 		"--format=value(name)")) == nil {
 		log.Printf("Found rules for firewall '%s', deleting them", firewall)
-		errFirewall = control.FinishRunning(exec.Command("gcloud", "compute", "firewall-rules", "delete", "-q", firewall,
-			"--project="+d.project))
+		errFirewall = exec.Command("gcloud", "compute", "firewall-rules", "delete", "-q", firewall,
+			"--project="+d.project).Run()
 	} else {
 		log.Printf("Found no rules for firewall '%s', assuming resources are clean", firewall)
 	}
 	numLeakedFWRules, errCleanFirewalls := d.cleanupNetworkFirewalls()
 	var errSubnet error
 	if d.subnetwork != "" {
-		errSubnet = control.FinishRunning(exec.Command("gcloud", "compute", "networks", "subnets", "delete", "-q", d.subnetwork,
-			d.subnetworkRegion, "--project="+d.project))
+		errSubnet = exec.Command("gcloud", "compute", "networks", "subnets", "delete", "-q", d.subnetwork,
+			d.subnetworkRegion, "--project="+d.project).Run()
 	}
-	errNetwork := control.FinishRunning(exec.Command("gcloud", "compute", "networks", "delete", "-q", d.network,
-		"--project="+d.project))
+	errNetwork := exec.Command("gcloud", "compute", "networks", "delete", "-q", d.network,
+		"--project="+d.project).Run()
 	if errCluster != nil {
 		return fmt.Errorf("error deleting cluster: %v", errCluster)
 	}
@@ -639,7 +640,7 @@ func (d *deployer) containerArgs(args ...string) []string {
 }
 
 func (d *deployer) GetClusterCreated(gcpProject string) (time.Time, error) {
-	res, err := control.Output(exec.Command(
+	res, err := exec.Output(exec.Command(
 		"gcloud",
 		"compute",
 		"instance-groups",
@@ -655,4 +656,9 @@ func (d *deployer) GetClusterCreated(gcpProject string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse time failed : got gcloud res %s, err %v", string(res), err)
 	}
 	return created, nil
+}
+
+func runWithNoOutput(cmd exec.Cmd) error {
+	cmd.NoOutput()
+	return cmd.Run()
 }
