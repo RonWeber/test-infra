@@ -22,8 +22,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	realexec "os/exec" // Only for ExitError; Use kubetest2/pkg/exec to actually exec stuff
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -88,10 +90,10 @@ type deployer struct {
 	commandGroupFlag            string
 	createCommandFlag           string
 	singleZoneNodeInstanceGroup bool
-	customSubnet            string
-	gcpCloudSDK string
-	gcpProjectType string
-	gcpServiceAccount string
+	customSubnet                string
+	gcpCloudSDK                 string
+	gcpProjectType              string
+	gcpServiceAccount           string
 
 	setup          bool   //!
 	kubecfg        string //!
@@ -180,20 +182,18 @@ func (d *deployer) createCommand() []string {
 }
 
 func (d *deployer) endpoint() (string, error) {
-	var result string
 	switch env := d.gkeEnvironment; {
 	case env == "test":
-		result = "https://test-container.sandbox.googleapis.com/"
+		return "https://test-container.sandbox.googleapis.com/", nil
 	case env == "staging":
-		result = "https://staging-container.sandbox.googleapis.com/"
+		return "https://staging-container.sandbox.googleapis.com/", nil
 	case env == "prod":
-		result = "https://container.googleapis.com/"
+		return "https://container.googleapis.com/", nil
 	case urlRe.MatchString(env):
-		result = env
+		return env, nil
 	default:
 		return "", fmt.Errorf("--gke-environment must be one of {test,staging,prod} or match %v, found %q", urlRe, env)
 	}
-	return "", nil
 }
 
 // assert that New implements types.NewDeployer
@@ -491,7 +491,7 @@ func (d *deployer) ensureFirewall() error {
 		"--limit=1",
 		"--format=get(tags.items)"))
 	if err != nil {
-		return fmt.Errorf("instances list failed: %s", err)
+		return fmt.Errorf("instances list failed: %s", execError(err))
 	}
 	tag := strings.TrimSpace(string(tagOut))
 	if tag == "" {
@@ -521,7 +521,7 @@ func (d *deployer) getInstanceGroups() error {
 		"--project="+d.project,
 		location)...))
 	if err != nil {
-		return fmt.Errorf("instance group URL fetch failed: %s", util.ExecError(err))
+		return fmt.Errorf("instance group URL fetch failed: %s", execError(err))
 	}
 	igURLs := strings.Split(strings.TrimSpace(string(igs)), ";")
 	if len(igURLs) == 0 {
@@ -557,7 +557,7 @@ func (d *deployer) cleanupNetworkFirewalls() (int, error) {
 		"--project="+d.project,
 		"--filter=network:"+d.network))
 	if err != nil {
-		return 0, fmt.Errorf("firewall rules list failed: %s", util.ExecError(err))
+		return 0, fmt.Errorf("firewall rules list failed: %s", execError(err))
 	}
 	if len(fws) > 0 {
 		fwList := strings.Split(strings.TrimSpace(string(fws)), "\n")
@@ -582,11 +582,16 @@ func (d *deployer) Down() error {
 	}
 	d.instanceGroups = nil
 
+	loc, err := d.location()
+	if err != nil {
+		return err
+	}
+
 	// We best-effort try all of these and report errors as appropriate.
 	errCluster := exec.Command(
 		"gcloud", d.containerArgs("clusters", "delete", "-q", d.cluster,
 			"--project="+d.project,
-			d.location)...).Run()
+			loc)...).Run()
 
 	// don't delete default network
 	if d.network == "default" {
@@ -597,7 +602,7 @@ func (d *deployer) Down() error {
 	}
 
 	var errFirewall error
-	if control.NoOutput(exec.Command("gcloud", "compute", "firewall-rules", "describe", firewall,
+	if runWithNoOutput(exec.Command("gcloud", "compute", "firewall-rules", "describe", firewall,
 		"--project="+d.project,
 		"--format=value(name)")) == nil {
 		log.Printf("Found rules for firewall '%s', deleting them", firewall)
@@ -636,29 +641,19 @@ func (d *deployer) Down() error {
 }
 
 func (d *deployer) containerArgs(args ...string) []string {
-	return append(append(append([]string{}, d.commandGroup...), "container"), args...)
-}
-
-func (d *deployer) GetClusterCreated(gcpProject string) (time.Time, error) {
-	res, err := exec.Output(exec.Command(
-		"gcloud",
-		"compute",
-		"instance-groups",
-		"list",
-		"--project="+gcpProject,
-		"--format=json(name,creationTimestamp)"))
-	if err != nil {
-		return time.Time{}, fmt.Errorf("list instance-group failed : %v", err)
-	}
-
-	created, err := getLatestClusterUpTime(string(res))
-	if err != nil {
-		return time.Time{}, fmt.Errorf("parse time failed : got gcloud res %s, err %v", string(res), err)
-	}
-	return created, nil
+	return append(append(append([]string{}, strings.Fields(d.commandGroupFlag)...), "container"), args...)
 }
 
 func runWithNoOutput(cmd exec.Cmd) error {
-	cmd.NoOutput()
+	exec.NoOutput(cmd)
 	return cmd.Run()
+}
+
+// execError returns a string format of err including stderr if the
+// err is an ExitError, useful for errors from e.g. exec.Cmd.Output().
+func execError(err error) string {
+	if ee, ok := err.(*realexec.ExitError); ok {
+		return fmt.Sprintf("%v (output: %q)", err, string(ee.Stderr))
+	}
+	return err.Error()
 }
