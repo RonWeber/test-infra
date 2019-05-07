@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"log"
 	"os"
 )
 
@@ -48,6 +49,7 @@ var DefaultCmder = &LocalCmder{}
 
 // Command is a convience wrapper over DefaultCmder.Command
 func Command(command string, args ...string) Cmd {
+	log.Printf("Creating command %s %v", command, args)
 	return DefaultCmder.Command(command, args...)
 }
 

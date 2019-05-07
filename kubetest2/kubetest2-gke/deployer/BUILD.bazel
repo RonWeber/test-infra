@@ -2,7 +2,10 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
-    srcs = ["deployer.go"],
+    srcs = [
+        "deployer.go",
+        "commandutils.go",
+        ],
     importpath = "k8s.io/test-infra/kubetest2/kubetest2-gke/deployer",
     visibility = ["//visibility:public"],
     deps = [

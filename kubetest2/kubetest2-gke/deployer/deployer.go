@@ -33,6 +33,7 @@ import (
 
 	"k8s.io/test-infra/kubetest2/pkg/exec"
 	"k8s.io/test-infra/kubetest2/pkg/metadata"
+
 	//"k8s.io/test-infra/kubetest2/pkg/process"
 	"k8s.io/test-infra/kubetest2/pkg/types"
 )
@@ -95,7 +96,9 @@ type deployer struct {
 	gcpProjectType              string
 	gcpServiceAccount           string
 
-	setup          bool   //!
+	gcpPrepared  bool
+	testPrepared bool
+
 	kubecfg        string //!
 	instanceGroups []*ig  //!
 
@@ -229,7 +232,7 @@ func bindFlags(d *deployer) *pflag.FlagSet {
 var _ types.Deployer = &deployer{}
 
 func (d *deployer) Build() error {
-	return fmt.Errorf("build is not implemented for GKE deployer.")
+	return fmt.Errorf("build is not implemented for GKE deployer")
 }
 
 // Deployer implementation methods below
@@ -237,15 +240,19 @@ func (d *deployer) Up() error {
 	if err := d.verifyFlags(); err != nil {
 		return err
 	}
+	if err := d.prepareGcpIfNeeded(); err != nil {
+		return err
+	}
+
 	// Create network if it doesn't exist.
 	if runWithNoOutput(exec.Command("gcloud", "compute", "networks", "describe", d.network,
 		"--project="+d.project,
 		"--format=value(name)")) != nil {
 		// Assume error implies non-existent.
 		log.Printf("Couldn't describe network '%s', assuming it doesn't exist and creating it", d.network)
-		if err := exec.Command("gcloud", "compute", "networks", "create", d.network,
+		if err := runWithOutput(exec.Command("gcloud", "compute", "networks", "create", d.network,
 			"--project="+d.project,
-			"--subnet-mode=auto").Run(); err != nil {
+			"--subnet-mode=auto")); err != nil {
 			return err
 		}
 	}
@@ -255,7 +262,7 @@ func (d *deployer) Up() error {
 		createSubnetCommand := []string{"compute", "networks", "subnets", "create"}
 		createSubnetCommand = append(createSubnetCommand, "--project="+d.project, "--network="+d.network)
 		createSubnetCommand = append(createSubnetCommand, customSubnetFields...)
-		if err := exec.Command("gcloud", createSubnetCommand...).Run(); err != nil {
+		if err := runWithOutput(exec.Command("gcloud", createSubnetCommand...)); err != nil {
 			return err
 		}
 		d.subnetwork = customSubnetFields[0]
@@ -281,6 +288,7 @@ func (d *deployer) Up() error {
 		"--num-nodes="+strconv.Itoa(def.Nodes),
 		"--network="+d.network,
 	)
+	log.Printf("Line 286")
 
 	args = append(args, def.ExtraArgs...)
 	if strings.ToUpper(d.image) == "CUSTOM" {
@@ -306,13 +314,17 @@ func (d *deployer) Up() error {
 			}
 		}
 	}
+
+	fmt.Printf("Environment: %v", os.Environ())
+
 	// TODO(zmerlynn): The version should be plumbed through Extract
 	// or a separate flag rather than magic env variables.
 	if v := os.Getenv("CLUSTER_API_VERSION"); v != "" {
 		args = append(args, "--cluster-version="+v)
 	}
 	args = append(args, d.cluster)
-	if err := exec.Command("gcloud", args...).Run(); err != nil {
+	fmt.Printf("Gcloud command: gcloud %+v", args)
+	if err := runWithOutput(exec.Command("gcloud", args...)); err != nil {
 		return fmt.Errorf("error creating cluster: %v", err)
 	}
 	for poolName, pool := range shape {
@@ -326,10 +338,11 @@ func (d *deployer) Up() error {
 			"--machine-type=" + pool.MachineType,
 			"--num-nodes=" + strconv.Itoa(pool.Nodes)}
 		poolArgs = append(poolArgs, pool.ExtraArgs...)
-		if err := exec.Command("gcloud", d.containerArgs(poolArgs...)...).Run(); err != nil {
+		if err := runWithOutput(exec.Command("gcloud", d.containerArgs(poolArgs...)...)); err != nil {
 			return fmt.Errorf("error creating node pool %q: %v", poolName, err)
 		}
 	}
+	log.Printf("Line 336")
 	return nil
 }
 
@@ -395,16 +408,16 @@ export KUBE_NODE_OS_DISTRIBUTION='%[3]s'
 	} else {
 		dumpCmd = fmt.Sprintf("./cluster/log-dump/log-dump.sh '%s' '%s'", d.localLogsDir, d.gcsLogsDir)
 	}
-	return exec.Command("bash", "-c", fmt.Sprintf(gkeLogDumpTemplate,
+	return runWithOutput(exec.Command("bash", "-c", fmt.Sprintf(gkeLogDumpTemplate,
 		d.project,
 		d.zone,
 		os.Getenv("NODE_OS_DISTRIBUTION"),
 		strings.Join(filters, " OR "),
-		dumpCmd)).Run()
+		dumpCmd)))
 }
 
 func (d *deployer) TestSetup() error {
-	if d.setup {
+	if d.testPrepared {
 		// Ensure setup is a singleton.
 		return nil
 	}
@@ -420,7 +433,7 @@ func (d *deployer) TestSetup() error {
 	if err := d.setupEnv(); err != nil {
 		return err
 	}
-	d.setup = true
+	d.testPrepared = true
 	return nil
 }
 
@@ -440,9 +453,9 @@ func (d *deployer) getKubeConfig() error {
 	if err != nil {
 		return err
 	}
-	if err := exec.Command("gcloud", d.containerArgs("clusters", "get-credentials", d.cluster,
+	if err := runWithOutput(exec.Command("gcloud", d.containerArgs("clusters", "get-credentials", d.cluster,
 		"--project="+d.project,
-		loc)...).Run(); err != nil {
+		loc)...)); err != nil {
 		return fmt.Errorf("error executing get-credentials: %v", err)
 	}
 	return nil
@@ -498,11 +511,11 @@ func (d *deployer) ensureFirewall() error {
 		return fmt.Errorf("instances list returned no instances (or instance has no tags)")
 	}
 
-	if err := exec.Command("gcloud", "compute", "firewall-rules", "create", firewall,
+	if err := runWithOutput(exec.Command("gcloud", "compute", "firewall-rules", "create", firewall,
 		"--project="+d.project,
 		"--network="+d.network,
 		"--allow="+e2eAllow,
-		"--target-tags="+tag).Run(); err != nil {
+		"--target-tags="+tag)); err != nil {
 		return fmt.Errorf("error creating e2e firewall: %v", err)
 	}
 	return nil
@@ -565,7 +578,7 @@ func (d *deployer) cleanupNetworkFirewalls() (int, error) {
 		commandArgs := []string{"compute", "firewall-rules", "delete", "-q"}
 		commandArgs = append(commandArgs, fwList...)
 		commandArgs = append(commandArgs, "--project="+d.project)
-		errFirewall := exec.Command("gcloud", commandArgs...).Run()
+		errFirewall := runWithOutput(exec.Command("gcloud", commandArgs...))
 		if errFirewall != nil {
 			return 0, fmt.Errorf("error deleting firewall: %v", errFirewall)
 		}
@@ -575,6 +588,12 @@ func (d *deployer) cleanupNetworkFirewalls() (int, error) {
 }
 
 func (d *deployer) Down() error {
+	if err := d.verifyFlags(); err != nil {
+		return err
+	}
+	if err := d.prepareGcpIfNeeded(); err != nil {
+		return err
+	}
 	firewall, err := d.getClusterFirewall()
 	if err != nil {
 		// This is expected if the cluster doesn't exist.
@@ -588,10 +607,10 @@ func (d *deployer) Down() error {
 	}
 
 	// We best-effort try all of these and report errors as appropriate.
-	errCluster := exec.Command(
+	errCluster := runWithOutput(exec.Command(
 		"gcloud", d.containerArgs("clusters", "delete", "-q", d.cluster,
 			"--project="+d.project,
-			loc)...).Run()
+			loc)...))
 
 	// don't delete default network
 	if d.network == "default" {
@@ -614,11 +633,11 @@ func (d *deployer) Down() error {
 	numLeakedFWRules, errCleanFirewalls := d.cleanupNetworkFirewalls()
 	var errSubnet error
 	if d.subnetwork != "" {
-		errSubnet = exec.Command("gcloud", "compute", "networks", "subnets", "delete", "-q", d.subnetwork,
-			d.subnetworkRegion, "--project="+d.project).Run()
+		errSubnet = runWithOutput(exec.Command("gcloud", "compute", "networks", "subnets", "delete", "-q", d.subnetwork,
+			d.subnetworkRegion, "--project="+d.project))
 	}
-	errNetwork := exec.Command("gcloud", "compute", "networks", "delete", "-q", d.network,
-		"--project="+d.project).Run()
+	errNetwork := runWithOutput(exec.Command("gcloud", "compute", "networks", "delete", "-q", d.network,
+		"--project="+d.project))
 	if errCluster != nil {
 		return fmt.Errorf("error deleting cluster: %v", errCluster)
 	}
@@ -646,6 +665,11 @@ func (d *deployer) containerArgs(args ...string) []string {
 
 func runWithNoOutput(cmd exec.Cmd) error {
 	exec.NoOutput(cmd)
+	return cmd.Run()
+}
+
+func runWithOutput(cmd exec.Cmd) error {
+	exec.InheritOutput(cmd)
 	return cmd.Run()
 }
 

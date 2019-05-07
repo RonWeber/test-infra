@@ -225,6 +225,7 @@ func (o *options) ShouldBuild() bool {
 }
 
 func (o *options) ShouldUp() bool {
+	fmt.Printf("Up is %v", o.up)
 	return o.up
 }
 

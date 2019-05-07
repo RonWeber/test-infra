@@ -18,6 +18,7 @@ limitations under the License.
 package deployer
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,6 +147,7 @@ func (d *deployer) DumpClusterLogs() error {
 }
 
 func (d *deployer) Build() error {
+	fmt.Printf("Buildin'...")
 	// TODO(bentheelder): build type should be configurable
 	args := []string{
 		"build", "node-image",

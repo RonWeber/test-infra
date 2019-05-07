@@ -32,6 +32,7 @@ import (
 func Main(deployerName string, newDeployer types.NewDeployer) {
 	// see cmd.go for the rest of the CLI boilerplate
 	if err := Run(deployerName, newDeployer); err != nil {
+		fmt.Printf("Error: %v", err)
 		// only print the error if it's not an IncorrectUsage (which we've)
 		// already output along with usage
 		if _, isUsage := err.(types.IncorrectUsage); !isUsage {
@@ -92,8 +93,11 @@ func RealMain(opts types.Options, d types.Deployer, tester types.Tester) (result
 
 	// up a cluster
 	if opts.ShouldUp() {
+		fmt.Println("We should up")
 		// TODO(bentheelder): this should write out to JUnit
 		if err := writer.WrapStep("Up", d.Up); err != nil {
+			fmt.Printf("Error: %v", err)
+
 			// we do not continue to test if build fails
 			return err
 		}
